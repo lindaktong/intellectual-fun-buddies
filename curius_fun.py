@@ -1,17 +1,13 @@
 import requests
-from requests.exceptions import HTTPError
+from requests.exceptions import HTTPError, ConnectionError, Timeout
 from bs4 import BeautifulSoup
-import openai
-import os
 from openai import OpenAI
 import tiktoken
 from itertools import islice
-import sys
 import numpy as np
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
-import requests
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
-# EMBEDDING ------------------------------------------------------
+# EMBEDDING A LINK ------------------------------------------------------
 
 # Get num tokens
 def num_tokens_from_string(string: str, encoding_name: str) -> int:
@@ -65,59 +61,61 @@ def len_safe_get_embedding(text, model=EMBEDDING_MODEL, max_tokens=EMBEDDING_CTX
         chunk_embeddings = chunk_embeddings.tolist()
     return chunk_embeddings
 
-# EMBEDDING STUFF ------------------------------------------------------
+# EMBEDDING A USER ------------------------------------------------------
 
-response = requests.get("https://curius.app/api/users/2055/links?page=0")
-# print(response.content)
-json = response.json()
+@retry(stop=stop_after_attempt(5), wait=wait_fixed(2), retry=retry_if_exception_type((ConnectionError, Timeout)))
+def robust_get(url):
+    return requests.get(url)
 
-# for each curius page, embed all the links
+def process_link(url):
+    try:
+        link_response = robust_get(url)
+        if link_response.status_code == 200:
+            html = link_response.text
+            soup = BeautifulSoup(html, 'html.parser')
+            text = ' '.join(soup.stripped_strings)
+            if text:
+                return len_safe_get_embedding(text, model="text-embedding-3-small")
+    except Exception as e:
+        print(f"Failed to process URL {url}: {e}")
+    return None
 
-user_embeddings_list = []
+def fetch_and_process_pages(base_url, start_page=0):
+    page = start_page
+    user_embeddings_list = []
 
-for i in range(len(json['userSaved'])):
+    while True:
+        url = f"{base_url}?page={page}"
+        response = requests.get(url)
+        if response.status_code != 200:
+            print("Failed to fetch data:", response.status_code)
+            break
 
-    i = 26
+        data = response.json()
 
-    # Scrape link
-    url = json['userSaved'][i]['link']
-    print(i, url)
-    link_response = requests.get(url)
-    print(link_response.status_code)
+        if not data['userSaved']:  
+            print("No more data available.")
+            break
 
-    # if successful
-    if link_response.__bool__():
-        html = link_response.text
-        print(html)
-        # soup = BeautifulSoup(html, 'html.parser')
-        soup = BeautifulSoup(html, 'html.parser')
+        for item in data['userSaved']:
+            link_url = item['link']
+            print(f"Processing URL: {link_url}")
+            embedding = process_link(link_url)
+            if embedding is not None:
+                user_embeddings_list.append(embedding)
 
-        # Extract text from the parsed HTML
-        text = ' '.join(soup.stripped_strings)
-        # print(text)
+        page += 1
 
-        if text != '':
-        # Add embedding for link
-            user_embeddings_list.append(len_safe_get_embedding(text, model="text-embedding-3-small"))
-        else:
-            pass
-    else:
-        pass
+    if not user_embeddings_list:
+        return None
 
-# Convert the list to a NumPy array when ready
-embeddings_array = np.array(user_embeddings_list)
+    embeddings_array = np.array(user_embeddings_list)
+    average_embedding = np.mean(embeddings_array, axis=0)
+    normalized_average_embedding = average_embedding / np.linalg.norm(average_embedding)
+    
+    return normalized_average_embedding.tolist()
 
-# if response.status_code == 200:
-#     print("Success!")
-# elif response.status_code == 404:
-#     print("Not Found.")
-
-# if response.__bool__():
-#     print("Success!")
-# else:
-#     raise Exception(f"Non-success status code: {response.status_code}")
-
-# print(text)
-print(num_tokens_from_string(text, "cl100k_base"))
-
-# Example of appending an embedding to the list
+# Example usage
+base_url = "https://curius.app/api/users/2414/links"
+user_embedding = fetch_and_process_pages(base_url)
+print(user_embedding)
